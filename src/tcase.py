@@ -12,7 +12,7 @@ from typing import ClassVar
 class TRow:
     """ Row in xlsx worksheet in TestIt import."""
     id: int = 0
-    project: str = ''
+    direction: str = ''
     suite: str = ''
     case: str = ''
     automated: bool = False
@@ -54,7 +54,7 @@ class TRow:
     def get_row(cls, ws: Worksheet, row_index):
         row = cls()
         row.id = ws.cell(row=row_index, column=cls.testit_xlsx_headers['Id']).value
-        row.project = ws.cell(row=row_index, column=cls.testit_xlsx_headers['Direction']).value
+        row.direction = ws.cell(row=row_index, column=cls.testit_xlsx_headers['Direction']).value
         row.suite = ws.cell(row=row_index, column=cls.testit_xlsx_headers['Section']).value
         row.case = ws.cell(row=row_index, column=cls.testit_xlsx_headers['TestCaseName']).value
         row.automated = cls.get_bool(ws.cell(row=row_index, column=cls.testit_xlsx_headers['Automated']).value)
@@ -254,7 +254,7 @@ class TSuite:
     title: str = ''             # xlsx TestCaseName
     description: str = ''       # дублируем с title
     preconditions: str = ''     # предусловия раздела
-    suites: list = None         # подразделы, в Testit их нет, оставляем пустым
+    suites: list = field(default_factory=list)         # подразделы, в Testit описаны через / в Direction (путь) и Section (конец пути)
     cases: list[TCase] = field(default_factory=list)   # список тест кейсов, по умолчанию пустой
     __id: ClassVar[int] = 10       # переменная класса, нужна, чтобы была сквозная нумерация разделов
 
@@ -269,64 +269,93 @@ class TSuite:
             "title": self.title,
             "description": self.title,
             "preconditions": self.preconditions,
-            "suites": [],
+            "suites": [suite.json() for suite in self.suites],
             "cases": [case.json() for case in self.cases]
         }
         print(f'Suite: {self.title} -----------------------------')
         print(d)
         return d
 
+    def add_case(self, case: TCase):
+        """ Добавляем тест в список тестов."""
+        self.cases.append(case)
+
     @classmethod
-    def create(cls, row: TRow):
+    def create(cls, row: TRow | None, suite_name: str | None = None):
         """ Создаем раздел по записи в таблице"""
         suite = cls()
-        suite.title = row.suite
-        suite.description = row.suite
+        if row:
+            suite.title = row.suite if row else 'Root'
+            suite.description = row.suite if row else 'Root'
+        else:
+            suite.title = suite_name
+            suite.description = suite_name
         suite.id = cls.get_next_id()
+
         return suite
 
 
 class TProject:
 
-    def __init__(self):
-        self.suites: list[TSuite] = []    # список разделов (в Testit без подразделов)
-        self.case: TCase | None = None    # собираемый case
+    def __init__(self, project_name: str):
+        self.suite_tree: TSuite = TSuite.create(None)           # дерево разделов (в Testit без подразделов)
+        self.path: dict = {project_name: self.suite_tree}    # быстрый поиск пути к вершине по кортежу названий разделов в пути
+        self.case: TCase | None = None                          # текущий case, который мы будем дальше дочитывать, уже в дереве
 
     def json(self):
         json_project = {
-            'suites': [suite.json() for suite in self.suites]
+            'suites': [suite.json() for suite in self.suite_tree.suites]
         }
         print(f'PROJECT ====================================================')
         return json_project
 
     def add_row(self, row: TRow):
-        # строка заголовка, сначала разберемся с предыдущим кейсом - добавим его в suite
         if row.is_empty:
             return
         if row.id:
-            # если раздела нет или в строке название раздела поменялось, добавляем новый раздел
-            if not self.suites or self.suites[-1].description != row.suite:
-                self.suites.append(TSuite.create(row))
-            # тут закончился предыдущий кейс, надо добавить его в проект/раздел
-            self.add_case()
+            # создаем новый кейс
             self.case = TCase.create(row)
+            # выясняем в какой раздел добавлять, если нет - создаем
+            suite = self.get_suite(row)
+            suite.add_case(self.case)
         else:
+            # или добавляем информацию к текущему разбираемому кейсу
             self.case.add_row(row)
 
-    def add_case(self):
-        """ Добавляем текущий тест в последний suite. Если они есть."""
-        if self.case is None or not self.suites:
-            return
-        self.suites[-1].cases.append(self.case)
+    def get_suite(self, row: TRow) -> TSuite:
+        """ Возвращает ссылку на раздел в дереве разделов.
+            Если надо, создает все TSuite по пути.
+        """
+        directions = row.direction.split('/')
+        directions.append(row.suite)
+        # если этот раздел уже заведен, вернем его
+        suite_path = '/'.join(directions)
+        if suite_path in self.path:
+            return self.path[suite_path]
+        parent = self.suite_tree
+        path = directions[0]
+        for suite in directions[1:]:
+            path = path + '/' + suite
+            # идем по узлам к последнему существующему в пути разделу
+            if path in self.path:
+                parent = self.path[path]
+            else:
+                # если раздела нет, то создаем его, добавляем в дерево
+                parent.suites.append(TSuite.create(row=None, suite_name=suite))
+                # теперь этот узел - последний в пути
+                parent = parent.suites[-1]
+                # и регистрируем в словаре
+                self.path[path] = parent
+        return parent
 
 
 def load_xlsx(filename: str):
     """ По xlsx файлу строит json файл."""
     wb = load_workbook(filename=filename)
     ws = wb.active
-    print(type(ws))
+    print(type(ws), ws.title)
     print(ws.max_column, ws.max_row)
-    project: TProject = TProject()
+    project: TProject = TProject(ws.title.replace('Project_', ''))
     for row_index in range(2, ws.max_row + 1):
         row: TRow = TRow.get_row(ws, row_index=row_index)
         print(row)
@@ -336,8 +365,6 @@ def load_xlsx(filename: str):
         else:
             project.add_row(row)
             print(f"Row {row_index} parsed .. OK", file=sys.stderr)
-    # последний тест еще не добавлен в проект, добавляем его руками
-    project.add_case()
     return project
 
 
@@ -346,6 +373,7 @@ if __name__ == '__main__':
     filename = '../xlsx/Test IT - 5 draft tests and checklists.xlsx'
     filename = '../xlsx/Test IT - 5 draft tests without checklists.xlsx'
     filename = '../xlsx/Test IT - glory.xlsx'
+    filename = '../xlsx/Test IT - 3 draft tests.xlsx'
     project = load_xlsx(filename=filename)
     with open('../json/qase.json', 'w') as fout:
         json.dump(project.json(), fp=fout)
